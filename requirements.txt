@@ -1,0 +1,5 @@
+google-adk==2.6.3
+mcp==1.29.0
+google-cloud-logging>=3.10
+google-auth>=2.30
+uvicorn>=0.30
