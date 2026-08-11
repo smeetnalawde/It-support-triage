@@ -1,0 +1,90 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:  # deploy job only runs from here, on purpose
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  MCP_SERVICE: it-support-mcp
+  AGENT_SERVICE: it-support-agent
+  AGENT_SA_NAME: it-support-agent-sa
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r mcp_server/requirements.txt
+          pip install -r requirements-dev.txt
+      - run: ruff check .
+      - name: Test
+        env:
+          MCP_REQUIRE_AUTH: "false"
+        run: pytest mcp_server/tests tests -q
+
+  # Deploys both Cloud Run services. Needs GCP_PROJECT_ID and
+  # GCP_SA_KEY (or Workload Identity Federation, swap the auth step below)
+  # configured as repo secrets — this job is a no-op without them.
+  # Trigger manually from the Actions tab once secrets are set.
+  deploy:
+    needs: lint-and-test
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Enable required APIs
+        run: |
+          gcloud services enable run.googleapis.com aiplatform.googleapis.com \
+            cloudbuild.googleapis.com artifactregistry.googleapis.com logging.googleapis.com
+
+      - name: Deploy MCP server (private)
+        run: |
+          gcloud run deploy ${{ env.MCP_SERVICE }} \
+            --source ./mcp_server --region ${{ env.REGION }} \
+            --no-allow-unauthenticated --port 8080
+
+      - name: Create agent service account (idempotent)
+        run: |
+          gcloud iam service-accounts create ${{ env.AGENT_SA_NAME }} \
+            --display-name "IT Support Agent runtime SA" || true
+
+      - name: Grant least-privilege IAM
+        run: |
+          MCP_URL=$(gcloud run services describe ${{ env.MCP_SERVICE }} \
+            --region ${{ env.REGION }} --format 'value(status.url)')
+          echo "MCP_URL=$MCP_URL" >> "$GITHUB_ENV"
+
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member "serviceAccount:${{ env.AGENT_SA_NAME }}@${PROJECT_ID}.iam.gserviceaccount.com" \
+            --role roles/aiplatform.user --condition=None
+
+          gcloud run services add-iam-policy-binding ${{ env.MCP_SERVICE }} \
+            --region ${{ env.REGION }} \
+            --member "serviceAccount:${{ env.AGENT_SA_NAME }}@${PROJECT_ID}.iam.gserviceaccount.com" \
+            --role roles/run.invoker
+
+      - name: Deploy agent (private)
+        run: |
+          gcloud run deploy ${{ env.AGENT_SERVICE }} \
+            --source . --region ${{ env.REGION }} \
+            --service-account "${{ env.AGENT_SA_NAME }}@${PROJECT_ID}.iam.gserviceaccount.com" \
+            --no-allow-unauthenticated --port 8080 \
+            --set-env-vars "MODEL=gemini-2.5-flash,MCP_SERVER_URL=${MCP_URL}/mcp,MCP_REQUIRE_AUTH=true,GOOGLE_GENAI_USE_VERTEXAI=TRUE,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=${{ env.REGION }}"
